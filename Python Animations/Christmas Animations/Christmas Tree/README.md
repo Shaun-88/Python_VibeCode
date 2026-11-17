@@ -1,27 +1,38 @@
-# ASCII Christmas Tree Animation
+# 3D ASCII Christmas Room & Santa Animation
 
-A colorful, animated ASCII Christmas tree for your terminal written in pure Python (standard library only — no external packages required).
+A high-resolution, real-time 3D point-cloud ASCII animation built with Python, NumPy, Pillow, and Pygame-CE.
 
-## Features
+## Storyboard Sequence
 
-- 24-bit truecolor ANSI rendering (works on Windows Terminal, PowerShell, macOS, and Linux)
-- Pulsing star with animated rays
-- Twinkling ornaments and a swirling garland
-- Drifting snowfall in the background
-- Presents under the tree and an animated rainbow banner
-- Customizable themes (`classic`, `aurora`, `candy`), height, and FPS
+1. **Cozy Room Build (Down -> Up):** Shaded 3D floor planks, woven rug, brick fireplace with crackling flames & stockings, chimney wreath, upper-wall fairy lights, and a 3-part bay window (big center + small side panes) with crescent moon, stars, and falling snow.
+2. **3D Spinning Christmas Tree (Down -> Up):** Volumetric evergreen boughs, dark inner pine, spiraling gold garland, 3D spherical baubles, animated fairy lights, and a glowing 5-point star.
+3. **Santa Arrives & Conjures Gifts:** 3D Santa walks in from the left carrying his gift sack, conjures 5 ribboned 3D gift boxes out of the rug beside the tree with golden sparkles, and enters a cheerful `"HO! HO! HO!"` loop.
+4. **Banner & Endless Loop:** Shaded ASCII `"MERRY CHRISTMAS"` reveals below while the tree spins, lights twinkle, snow drifts outside, and Santa waves continuously.
 
-## Usage
+## Setup & Run
 
 ```bash
+pip install -r requirements.txt
 python christmas_tree.py
 ```
 
-### Options
+### Live Controls
 
-```bash
-python christmas_tree.py --theme aurora --height 20 --fps 15
-python christmas_tree.py --theme candy --no-snow
-```
+| Key | Action |
+| :--- | :--- |
+| `1`, `2`, `3` | Switch theme (`Classic`, `Candlelight`, `Aurora`) |
+| `M` | Cycle light animation mode (`Auto`, `Twinkle`, `Chase`, `Sparkle`, `Bands`) |
+| `S` | Toggle snowfall outside the window |
+| `H` | Hide/show bottom control bar (pure screensaver view) |
+| `F` | Toggle fullscreen |
+| `Space` | Pause / resume |
+| `R` | Replay full storyboard from the beginning |
+| `Q` / `Esc` | Quit cleanly |
 
-Press `Ctrl+C` to exit cleanly.
+### Project Files
+
+- `christmas_tree.py` — Storyboard timeline, DPI-aware `1440×900` `pygame-ce` window loop, and keyboard controls
+- `scene_models.py` — High-density 3D point-cloud builders (~50k-point tree, room, window, gifts, and articulated Santa)
+- `renderer.py` — `205×75` 3D Z-buffer rasterizer, ASCII luminance shading, crisp `Consolas` glyph atlas, and tight bloom
+- `themes.py` — Color palettes and easing functions
+- `requirements.txt` — Package dependencies (`numpy`, `pillow`, `pygame-ce`)

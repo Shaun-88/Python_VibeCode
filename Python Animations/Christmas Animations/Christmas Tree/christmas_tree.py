@@ -1,365 +1,372 @@
-"""Colorful animated ASCII Christmas tree for the terminal.
+"""Cozy 3D ASCII Christmas Room & Santa Animation.
 
-Uses only the Python standard library and ANSI 24-bit (truecolor) escape codes.
-Run with: python christmas_tree.py
-Press Ctrl+C to exit cleanly.
+Timeline:
+1. Cozy room (floor, rug, walls, snowy midnight window) rises bottom-to-top.
+2. 3D spinning Christmas tree grows bottom-to-top with garland, baubles, lights, and star.
+3. 3D Santa walks in from the left, conjures 3D ribboned gifts around the tree,
+   and stays in a cheerful "HO! HO! HO!" loop while "MERRY CHRISTMAS" glows below.
+
+Run:
+    pip install -r requirements.txt
+    python christmas_tree.py
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+from dataclasses import dataclass
 import math
 import os
-import random
-import shutil
-import sys
 import time
-from dataclasses import dataclass
+import numpy as np
+from PIL import Image
+import pygame
 
-RESET = "\033[0m"
-HIDE_CURSOR = "\033[?25l"
-SHOW_CURSOR = "\033[?25h"
-CLEAR_SCREEN = "\033[2J\033[H"
-CURSOR_HOME = "\033[H"
+from renderer import AsciiRenderer, WIN_H, WIN_W
+from scene_models import (
+    FLOOR_Y,
+    GiftsModel,
+    PointBatch,
+    RoomSceneModel,
+    SantaRig,
+    build_conjure_sparkles,
+    concat_batches,
+)
+from themes import (
+    LIGHT_MODES,
+    THEMES,
+    THEME_ORDER,
+    ease_out_back,
+    ease_out_cubic,
+    ramp,
+    smoothstep,
+)
 
 
-def rgb(r: int, g: int, b: int) -> str:
-    """Return an ANSI 24-bit foreground color escape sequence."""
-    return f"\033[38;2;{r};{g};{b}m"
+@dataclass
+class StoryState:
+    room_reveal: float
+    trunk_grow: float
+    tree_grow: float
+    garland_grow: float
+    ornament_grow: float
+    lights_power: float
+    star_grow: float
+    spin_angle: float
+    santa_visible: bool
+    santa_x: float
+    santa_z: float
+    santa_yaw: float
+    walk_phase: float
+    stride_amp: float
+    bend: float
+    wave: float
+    laugh_bounce: float
+    sack_on_back: bool
+    conjure_progress: float
+    gift_progress: float
+    title_reveal: float
+    ho_text: str | None
+    ho_alpha: float
 
 
-def bold_rgb(r: int, g: int, b: int) -> str:
-    """Return a bold ANSI 24-bit foreground color escape sequence."""
-    return f"\033[1;38;2;{r};{g};{b}m"
+def evaluate_story(t: float) -> StoryState:
+    """Compute all animation parameters at elapsed seconds `t`."""
+    # Act 1: Cozy Room builds bottom-to-top (0.0 -> 2.4s)
+    room_reveal = smoothstep(t, 0.0, 2.4)
+
+    # Act 2: Slow, lush 3D Tree growth & decoration bottom-to-top (2.4 -> 13.3s)
+    trunk_grow = ease_out_cubic(ramp(t, 2.4, 3.5))
+    tree_grow = smoothstep(t, 3.3, 8.1)
+    garland_grow = smoothstep(t, 7.8, 11.0)
+    ornament_grow = smoothstep(t, 10.6, 12.2)
+    lights_power = smoothstep(t, 11.8, 12.8)
+    star_grow = ease_out_back(ramp(t, 12.5, 13.3), overshoot=1.35)
+    spin_angle = max(0.0, t - 3.0) * 0.30
+
+    # Act 3: Santa walks in from off-screen left & conjures 3D gifts (13.2 -> 19.4s)
+    santa_visible = t >= 13.2
+    walk_u = smoothstep(t, 13.2, 16.2)
+    santa_x = -2.35 + (-0.52 - (-2.35)) * walk_u
+    santa_z = 0.18
+    stride_amp = math.sin(walk_u * math.pi) * 0.85 if walk_u < 1.0 else 0.0
+    walk_phase = max(0.0, t - 13.2) * 6.4
+    sack_on_back = t < 16.3
+    santa_yaw = -0.15 + 0.42 * smoothstep(t, 15.9, 16.6)
+
+    bend = math.sin(ramp(t, 16.2, 17.8) * math.pi) * 0.72 if 16.2 <= t <= 17.8 else 0.0
+    conjure_progress = ramp(t, 16.45, 19.1)
+    gift_progress = ramp(t, 16.7, 19.3)
+
+    # Act 4: MERRY CHRISTMAS reveal (19.2 -> 21.4s)
+    title_reveal = smoothstep(t, 19.2, 21.4)
+
+    # Act 5: Cheerful natural HO! HO! HO! loop (first greeting at 19.6s, then every 4.2s)
+    wave = 0.0
+    laugh_bounce = 0.0
+    ho_text: str | None = None
+    ho_alpha = 0.0
+
+    if t >= 19.6:
+        cycle_t = (t - 19.6) % 4.2
+        if cycle_t < 2.4:
+            wave = math.sin(ramp(cycle_t, 0.0, 2.4) * math.pi)
+            laugh_bounce = abs(math.sin(cycle_t * 5.6)) * wave
+            if cycle_t < 0.55:
+                ho_text = "HO!"
+            elif cycle_t < 1.05:
+                ho_text = "HO! HO!"
+            else:
+                ho_text = "HO! HO! HO!"
+            fade_in = ramp(cycle_t, 0.05, 0.25)
+            fade_out = 1.0 - ramp(cycle_t, 2.0, 2.4)
+            ho_alpha = min(fade_in, fade_out)
+        else:
+            laugh_bounce = 0.18 * (0.5 + 0.5 * math.sin(t * 2.2))
+
+    return StoryState(
+        room_reveal=room_reveal,
+        trunk_grow=trunk_grow,
+        tree_grow=tree_grow,
+        garland_grow=garland_grow,
+        ornament_grow=ornament_grow,
+        lights_power=lights_power,
+        star_grow=star_grow,
+        spin_angle=spin_angle,
+        santa_visible=santa_visible,
+        santa_x=santa_x,
+        santa_z=santa_z,
+        santa_yaw=santa_yaw,
+        walk_phase=walk_phase,
+        stride_amp=stride_amp,
+        bend=bend,
+        wave=wave,
+        laugh_bounce=laugh_bounce,
+        sack_on_back=sack_on_back,
+        conjure_progress=conjure_progress,
+        gift_progress=gift_progress,
+        title_reveal=title_reveal,
+        ho_text=ho_text,
+        ho_alpha=ho_alpha,
+    )
 
 
-def enable_windows_ansi() -> None:
-    """Enable Virtual Terminal Processing on Windows consoles."""
+class ChristmasDirector:
+    """Combines all 3D models and renderer into a frame generator."""
+
+    def __init__(self) -> None:
+        from scene_models import TreeModel  # local import keeps startup clean
+
+        self.room = RoomSceneModel()
+        self.tree = TreeModel()
+        self.gifts = GiftsModel()
+        self.santa = SantaRig()
+        self.renderer = AsciiRenderer()
+
+    def render_at(
+        self,
+        t: float,
+        theme_key: str,
+        light_mode: str,
+        snow_on: bool,
+        show_hints: bool,
+    ) -> np.ndarray:
+        palette = THEMES[theme_key]
+        st = evaluate_story(t)
+
+        tree_glow = st.lights_power * (0.70 + 0.30 * st.star_grow) * (0.85 + 0.15 * math.sin(t * 2.1))
+        batches: list[PointBatch] = [
+            self.room.build_batch(palette, t, st.room_reveal, snow_on, tree_glow),
+            self.tree.build_batch(
+                palette=palette,
+                t=t,
+                trunk_grow=st.trunk_grow,
+                tree_grow=st.tree_grow,
+                garland_grow=st.garland_grow,
+                ornament_grow=st.ornament_grow,
+                lights_power=st.lights_power,
+                star_grow=st.star_grow,
+                spin_angle=st.spin_angle,
+                light_mode=light_mode,
+            ),
+            self.gifts.build_batch(palette, st.gift_progress, ease_out_back),
+        ]
+
+        ho_bubble: tuple[np.ndarray, str, float] | None = None
+        if st.santa_visible:
+            santa_batch, hand_world = self.santa.build_batch(
+                t=t,
+                x_pos=st.santa_x,
+                z_pos=st.santa_z,
+                yaw=st.santa_yaw,
+                walk_phase=st.walk_phase,
+                stride_amp=st.stride_amp,
+                bend=st.bend,
+                wave=st.wave,
+                laugh_bounce=st.laugh_bounce,
+                sack_on_back=st.sack_on_back,
+            )
+            batches.append(santa_batch)
+            if 0.0 < st.conjure_progress < 1.0:
+                batches.append(build_conjure_sparkles(palette, hand_world, st.conjure_progress, t))
+            if st.ho_text and st.ho_alpha > 0.05:
+                anchor = np.array([st.santa_x + 0.32, FLOOR_Y + 0.78, st.santa_z], dtype=np.float32)
+                ho_bubble = (anchor, st.ho_text, st.ho_alpha)
+
+        scene_batch = concat_batches(batches)
+        return self.renderer.render_frame(
+            batch=scene_batch,
+            palette=palette,
+            t=t,
+            room_reveal=st.room_reveal,
+            title_reveal=st.title_reveal,
+            ho_bubble=ho_bubble,
+            show_hints=show_hints,
+            light_mode=light_mode,
+            snow_on=snow_on,
+        )
+
+
+def export_snapshots(
+    director: ChristmasDirector,
+    out_dir: str,
+    theme_key: str,
+    light_mode: str,
+    snow_on: bool,
+    show_hints: bool,
+) -> None:
+    """Render key storyboard timestamps to PNG files for inspection."""
+    os.makedirs(out_dir, exist_ok=True)
+    keyframes = (
+        ("01_room_build", 1.7),
+        ("02_tree_grow", 6.2),
+        ("03_tree_lit", 13.1),
+        ("04_santa_walk", 14.8),
+        ("05_gifts_conjure", 17.9),
+        ("06_final_loop", 21.35),
+    )
+    for name, ts in keyframes:
+        rgb = director.render_at(ts, theme_key, light_mode, snow_on, show_hints)
+        Image.fromarray(rgb, mode="RGB").save(os.path.join(out_dir, f"{name}.png"))
+
+
+def _enable_dpi_awareness() -> None:
     if os.name != "nt":
         return
     try:
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_ulong()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
     except Exception:
         pass
 
 
-THEMES: dict[str, dict[str, list[tuple[int, int, int]]]] = {
-    "classic": {
-        "foliage": [(24, 130, 52), (34, 155, 65), (18, 108, 42)],
-        "ornaments": [
-            (255, 59, 59),    # Ruby red
-            (255, 215, 0),    # Gold
-            (64, 196, 255),   # Ice blue
-            (255, 105, 180),  # Magenta pink
-            (255, 255, 255),  # Pearl white
-        ],
-        "garland": (255, 215, 90),
-        "star": (255, 230, 80),
-    },
-    "aurora": {
-        "foliage": [(18, 125, 110), (28, 160, 125), (15, 95, 90)],
-        "ornaments": [
-            (110, 255, 210),  # Mint
-            (130, 180, 255),  # Sky
-            (215, 130, 255),  # Lavender
-            (255, 235, 120),  # Pale gold
-            (255, 120, 190),  # Rose
-        ],
-        "garland": (150, 240, 255),
-        "star": (220, 255, 240),
-    },
-    "candy": {
-        "foliage": [(30, 145, 70), (45, 170, 85), (20, 115, 55)],
-        "ornaments": [
-            (255, 45, 85),    # Candy red
-            (255, 255, 255),  # Peppermint white
-            (255, 150, 200),  # Bubblegum
-            (100, 235, 255),  # Frost blue
-            (255, 210, 75),   # Caramel gold
-        ],
-        "garland": (255, 110, 150),
-        "star": (255, 240, 130),
-    },
-}
+def run_window(args: argparse.Namespace) -> None:
+    director = ChristmasDirector()
+    theme_idx = THEME_ORDER.index(args.theme)
+    mode_idx = LIGHT_MODES.index(args.mode)
+    snow_on = not args.no_snow
+    show_hints = not args.hide_ui
+    fullscreen = bool(args.fullscreen)
 
-ORNAMENT_CHARS = ["o", "O", "*", "@", "+"]
-SNOW_CHARS = [".", "*", "+", "·"]
+    if args.snapshot_dir:
+        export_snapshots(
+            director,
+            args.snapshot_dir,
+            THEME_ORDER[theme_idx],
+            LIGHT_MODES[mode_idx],
+            snow_on,
+            show_hints,
+        )
+        return
 
+    _enable_dpi_awareness()
+    pygame.init()
+    pygame.display.set_caption("Merry Christmas - 3D ASCII Room")
 
-@dataclass
-class Snowflake:
-    x: float
-    y: float
-    speed: float
-    drift: float
-    char: str
-    brightness: int
+    def create_screen(fs: bool) -> pygame.Surface:
+        flags = pygame.FULLSCREEN | pygame.SCALED if fs else pygame.RESIZABLE
+        return pygame.display.set_mode((WIN_W, WIN_H), flags)
 
+    screen = create_screen(fullscreen)
+    clock = pygame.time.Clock()
 
-def hsv_to_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
-    """Convert HSV (0..1) to RGB (0..255)."""
-    i = int(h * 6.0)
-    f = (h * 6.0) - i
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
-    i %= 6
-    if i == 0:
-        r, g, b = v, t, p
-    elif i == 1:
-        r, g, b = q, v, p
-    elif i == 2:
-        r, g, b = p, v, t
-    elif i == 3:
-        r, g, b = p, q, v
-    elif i == 4:
-        r, g, b = t, p, v
-    else:
-        r, g, b = v, p, q
-    return int(r * 255), int(g * 255), int(b * 255)
+    t_offset = 21.5 if args.skip_intro else 0.0
+    sim_t = t_offset
+    wall_start = time.monotonic()
+    paused = False
+    running = True
 
+    try:
+        while running:
+            dt = clock.tick(args.fps) / 1000.0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                        running = False
+                    elif event.key == pygame.K_1:
+                        theme_idx = 0
+                    elif event.key == pygame.K_2:
+                        theme_idx = 1
+                    elif event.key == pygame.K_3:
+                        theme_idx = 2
+                    elif event.key == pygame.K_m:
+                        mode_idx = (mode_idx + 1) % len(LIGHT_MODES)
+                    elif event.key == pygame.K_s:
+                        snow_on = not snow_on
+                    elif event.key == pygame.K_h:
+                        show_hints = not show_hints
+                    elif event.key == pygame.K_r:
+                        sim_t = 0.0
+                    elif event.key == pygame.K_SPACE:
+                        paused = not paused
+                    elif event.key == pygame.K_f:
+                        fullscreen = not fullscreen
+                        screen = create_screen(fullscreen)
 
-def build_tree_layout(height: int, rng: random.Random) -> dict[tuple[int, int], tuple[str, int]]:
-    """Precompute ornament positions and types for the tree."""
-    ornaments: dict[tuple[int, int], tuple[str, int]] = {}
-    for row in range(height):
-        tier_offset = row % 4
-        width = max(1, 1 + 2 * (row - tier_offset // 3))
-        left = -width // 2
-        right = width // 2
-        for col in range(left, right + 1):
-            if row >= 2 and abs(col) < width // 2 and rng.random() < 0.22:
-                char = rng.choice(ORNAMENT_CHARS)
-                phase = rng.randint(0, 100)
-                ornaments[(row, col)] = (char, phase)
-    return ornaments
+            if not paused:
+                sim_t += min(dt, 0.1)
 
-
-def render_frame(
-    frame_idx: int,
-    tree_height: int,
-    canvas_w: int,
-    canvas_h: int,
-    ornaments: dict[tuple[int, int], tuple[str, int]],
-    snowflakes: list[Snowflake],
-    theme_name: str,
-    show_snow: bool,
-) -> str:
-    """Render a single animation frame as a string."""
-    theme = THEMES[theme_name]
-    center_x = canvas_w // 2
-    top_y = 2
-
-    # Grid stores (char, ansi_color)
-    grid: list[list[tuple[str, str]]] = [
-        [(" ", "") for _ in range(canvas_w)] for _ in range(canvas_h)
-    ]
-
-    def put(x: int, y: int, ch: str, color: str) -> None:
-        if 0 <= x < canvas_w and 0 <= y < canvas_h:
-            grid[y][x] = (ch, color)
-
-    # 1. Background falling snow
-    if show_snow:
-        for flake in snowflakes:
-            fx = int(round(flake.x)) % canvas_w
-            fy = int(round(flake.y))
-            if 0 <= fy < canvas_h - 1:
-                b = flake.brightness
-                put(fx, fy, flake.char, rgb(b, b, min(255, b + 15)))
-
-    # 2. Star at the top (pulsing glow)
-    pulse = 0.75 + 0.25 * math.sin(frame_idx * 0.25)
-    sr, sg, sb = theme["star"]
-    star_col = bold_rgb(int(sr * pulse), int(sg * pulse), int(sb * pulse))
-    ray_col = rgb(int(sr * 0.65 * pulse), int(sg * 0.65 * pulse), int(sb * 0.55 * pulse))
-
-    if frame_idx % 6 < 3:
-        put(center_x, top_y - 1, "|", ray_col)
-        put(center_x - 2, top_y, "-", ray_col)
-        put(center_x + 2, top_y, "-", ray_col)
-    else:
-        put(center_x - 1, top_y - 1, "\\", ray_col)
-        put(center_x + 1, top_y - 1, "/", ray_col)
-    put(center_x - 1, top_y, "<", star_col)
-    put(center_x, top_y, "*", star_col)
-    put(center_x + 1, top_y, ">", star_col)
-
-    # 3. Tree foliage, garland, and twinkling ornaments
-    foliage_palette = theme["foliage"]
-    ornament_palette = theme["ornaments"]
-    gr, gg, gb = theme["garland"]
-
-    for row in range(tree_height):
-        y = top_y + 1 + row
-        if y >= canvas_h - 4:
-            break
-        tier_indent = (row % 4) // 2
-        half_w = max(0, row - tier_indent)
-        for col in range(-half_w, half_w + 1):
-            x = center_x + col
-            # Diagonal swirling garland wave
-            is_garland = (row + col - (frame_idx // 3)) % 5 == 0 and abs(col) < half_w
-            if (row, col) in ornaments:
-                ch, phase = ornaments[(row, col)]
-                twinkle = 0.55 + 0.45 * math.sin(frame_idx * 0.35 + phase)
-                base_r, base_g, base_b = ornament_palette[(phase + (frame_idx // 20)) % len(ornament_palette)]
-                color = bold_rgb(
-                    int(base_r * twinkle),
-                    int(base_g * twinkle),
-                    int(base_b * twinkle),
-                )
-                put(x, y, ch, color)
-            elif is_garland:
-                shimmer = 0.7 + 0.3 * math.sin(frame_idx * 0.3 + col * 0.4)
-                put(x, y, "~", rgb(int(gr * shimmer), int(gg * shimmer), int(gb * shimmer)))
+            rgb = director.render_at(
+                t=sim_t,
+                theme_key=THEME_ORDER[theme_idx],
+                light_mode=LIGHT_MODES[mode_idx],
+                snow_on=snow_on,
+                show_hints=show_hints,
+            )
+            surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+            if screen.get_size() != (WIN_W, WIN_H):
+                scaled = pygame.transform.smoothscale(surf, screen.get_size())
+                screen.blit(scaled, (0, 0))
             else:
-                if col == -half_w:
-                    ch = "/"
-                elif col == half_w:
-                    ch = "\\"
-                elif row % 4 == 3 and (col % 2 == 0):
-                    ch = "^"
-                else:
-                    ch = "*" if (row + col) % 3 == 0 else "^"
-                fr, fg, fb = foliage_palette[(row + abs(col)) % len(foliage_palette)]
-                put(x, y, ch, rgb(fr, fg, fb))
+                screen.blit(surf, (0, 0))
+            pygame.display.flip()
 
-    # 4. Trunk
-    trunk_top = top_y + 1 + min(tree_height, max(1, canvas_h - top_y - 5))
-    trunk_h = 3
-    trunk_color = rgb(139, 90, 43)
-    for ty in range(trunk_h):
-        y = trunk_top + ty
-        if y >= canvas_h - 2:
-            break
-        for dx in range(-2, 3):
-            put(center_x + dx, y, "|" if abs(dx) == 2 else "#", trunk_color)
+            if args.duration is not None and (time.monotonic() - wall_start) >= args.duration:
+                running = False
+    finally:
+        pygame.quit()
 
-    # 5. Presents under the tree
-    base_y = min(canvas_h - 2, trunk_top + trunk_h - 1)
-    gifts = [
-        (center_x - 8, "[+]", (220, 50, 60), (255, 215, 0)),
-        (center_x + 6, "[*]", (65, 165, 255), (255, 255, 255)),
-        (center_x - 13, "[#]", (190, 85, 245), (255, 220, 120)),
-    ]
-    for gx, gstr, box_col, ribbon_col in gifts:
-        for i, ch in enumerate(gstr):
-            c = bold_rgb(*ribbon_col) if i == 1 else rgb(*box_col)
-            put(gx + i, base_y, ch, c)
 
-    # 6. Snow ground line
-    ground_y = min(canvas_h - 2, base_y + 1)
-    for x in range(canvas_w):
-        if grid[ground_y][x][0] == " ":
-            put(x, ground_y, "_", rgb(200, 225, 255))
-
-    # 7. Festive animated rainbow banner
-    banner = "  *  M E R R Y   C H R I S T M A S  *  "
-    banner_y = min(canvas_h - 1, ground_y + 1)
-    start_x = max(0, center_x - len(banner) // 2)
-    for i, ch in enumerate(banner):
-        hue = ((i * 0.03) - (frame_idx * 0.02)) % 1.0
-        r, g, b = hsv_to_rgb(hue, 0.75, 1.0)
-        put(start_x + i, banner_y, ch, bold_rgb(r, g, b))
-
-    # Flatten grid into ANSI string
-    lines: list[str] = []
-    for row in grid:
-        out: list[str] = []
-        last_color = ""
-        for ch, color in row:
-            if color != last_color:
-                out.append(color if color else RESET)
-                last_color = color
-            out.append(ch)
-        if last_color:
-            out.append(RESET)
-        lines.append("".join(out))
-    return "\n".join(lines)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="3D Point-Cloud ASCII Christmas Room & Santa Animation."
+    )
+    parser.add_argument("--theme", choices=THEME_ORDER, default="classic", help="Starting theme")
+    parser.add_argument("--mode", choices=LIGHT_MODES, default="auto", help="Starting light mode")
+    parser.add_argument("--fps", type=int, default=30, help="Target frame rate (default: 30)")
+    parser.add_argument("--skip-intro", action="store_true", help="Jump straight to the final loop")
+    parser.add_argument("--no-snow", action="store_true", help="Start with window snow disabled")
+    parser.add_argument("--hide-ui", action="store_true", help="Start in pure screensaver mode")
+    parser.add_argument("--fullscreen", action="store_true", help="Launch in fullscreen")
+    parser.add_argument("--duration", type=float, default=None, help="Auto-exit after N seconds")
+    parser.add_argument("--snapshot-dir", type=str, default=None, help="Export storyboard PNGs and exit")
+    return parser.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Colorful animated ASCII Christmas tree.")
-    parser.add_argument("--height", type=int, default=18, help="Tree height in rows (default: 18)")
-    parser.add_argument("--fps", type=float, default=12.0, help="Frames per second (default: 12)")
-    parser.add_argument(
-        "--theme",
-        choices=sorted(THEMES.keys()),
-        default="classic",
-        help="Color theme (default: classic)",
-    )
-    parser.add_argument("--no-snow", action="store_true", help="Disable falling snow")
-    args = parser.parse_args()
-
-    enable_windows_ansi()
-    rng = random.Random()
-
-    term_size = shutil.get_terminal_size((80, 28))
-    canvas_w = max(50, min(term_size.columns - 1, 100))
-    tree_height = max(8, min(args.height, term_size.lines - 8))
-    canvas_h = max(tree_height + 8, min(term_size.lines - 1, tree_height + 10))
-
-    ornaments = build_tree_layout(tree_height, rng)
-
-    snowflakes: list[Snowflake] = []
-    if not args.no_snow:
-        num_flakes = max(20, canvas_w // 2)
-        for _ in range(num_flakes):
-            snowflakes.append(
-                Snowflake(
-                    x=rng.uniform(0, canvas_w),
-                    y=rng.uniform(0, canvas_h - 2),
-                    speed=rng.uniform(0.25, 0.65),
-                    drift=rng.uniform(-0.2, 0.2),
-                    char=rng.choice(SNOW_CHARS),
-                    brightness=rng.randint(150, 245),
-                )
-            )
-
-    frame_delay = 1.0 / max(1.0, args.fps)
-    sys.stdout.write(HIDE_CURSOR + CLEAR_SCREEN)
-    sys.stdout.flush()
-
-    frame_idx = 0
-    try:
-        while True:
-            t0 = time.perf_counter()
-            frame = render_frame(
-                frame_idx=frame_idx,
-                tree_height=tree_height,
-                canvas_w=canvas_w,
-                canvas_h=canvas_h,
-                ornaments=ornaments,
-                snowflakes=snowflakes,
-                theme_name=args.theme,
-                show_snow=not args.no_snow,
-            )
-            sys.stdout.write(CURSOR_HOME + frame)
-            sys.stdout.flush()
-
-            if not args.no_snow:
-                for flake in snowflakes:
-                    flake.y += flake.speed
-                    flake.x += flake.drift + 0.1 * math.sin(frame_idx * 0.1 + flake.y)
-                    if flake.y >= canvas_h - 2:
-                        flake.y = 0.0
-                        flake.x = rng.uniform(0, canvas_w)
-
-            frame_idx += 1
-            elapsed = time.perf_counter() - t0
-            if elapsed < frame_delay:
-                time.sleep(frame_delay - elapsed)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        sys.stdout.write(RESET + SHOW_CURSOR + "\n")
-        sys.stdout.flush()
+    run_window(parse_args())
 
 
 if __name__ == "__main__":
