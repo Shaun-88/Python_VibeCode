@@ -14,6 +14,9 @@ TREE_X = 0.74
 TREE_Z = 0.14
 
 WIN_Z = BACK_WALL_Z - 0.015
+CAL_X1, CAL_X2 = 1.24, 1.58
+CAL_Y1, CAL_Y2 = 0.25, 0.59
+CAL_Z = BACK_WALL_Z - 0.015
 # (x1, x2, y1, y2, has_vertical_mullion) -> Big center window flanked by 2 small side windows
 WINDOW_PANELS = (
     (-0.90, -0.68, 0.14, 0.70, False),
@@ -272,12 +275,17 @@ class RoomSceneModel:
         self.wreath_nrm = np.concatenate([wr_n, bow_n], axis=0).astype(np.float32)
         self.wreath_is_bow = np.concatenate([np.zeros(420, dtype=bool), np.ones(len(bow_p), dtype=bool)])
 
-        # 2 neat Christmas stockings hanging safely on the side brick pillars
+        # 3 neat Christmas stockings hung evenly along the fireplace mantel
         st_pos, st_nrm, st_col = [], [], []
-        for sx, main_rgb in ((-1.51, (0.88, 0.14, 0.18)), (-1.11, (0.14, 0.64, 0.34))):
-            cuff_p, cuff_n = _blob(rng, (sx, -0.135, fp_z - 0.05), (0.032, 0.018, 0.016), 80, 0.6)
-            leg_p, leg_n = _tube(rng, (sx, -0.15, fp_z - 0.05), (sx, -0.245, fp_z - 0.05), 0.023, 110)
-            toe_p, toe_n = _blob(rng, (sx + 0.024, -0.250, fp_z - 0.05), (0.033, 0.020, 0.018), 80, 0.6)
+        stocking_specs = (
+            (-1.48, (0.90, 0.16, 0.20)),
+            (-1.31, (0.16, 0.68, 0.34)),
+            (-1.14, (0.96, 0.72, 0.20)),
+        )
+        for sx, main_rgb in stocking_specs:
+            cuff_p, cuff_n = _blob(rng, (sx, -0.130, fp_z - 0.05), (0.028, 0.016, 0.015), 75, 0.6)
+            leg_p, leg_n = _tube(rng, (sx, -0.145, fp_z - 0.05), (sx, -0.215, fp_z - 0.05), 0.020, 95)
+            toe_p, toe_n = _blob(rng, (sx + 0.022, -0.220, fp_z - 0.05), (0.029, 0.018, 0.016), 75, 0.6)
             st_pos.extend([cuff_p, leg_p, toe_p])
             st_nrm.extend([cuff_n, leg_n, toe_n])
             st_col.extend([
@@ -288,6 +296,21 @@ class RoomSceneModel:
         self.stocking_pos = np.concatenate(st_pos, axis=0).astype(np.float32)
         self.stocking_nrm = np.concatenate(st_nrm, axis=0).astype(np.float32)
         self.stocking_col = np.concatenate(st_col, axis=0).astype(np.float32)
+
+        # Small "DEC 25" wall calendar on the upper-right wall beside the tree
+        cal_mid_x = 0.5 * (CAL_X1 + CAL_X2)
+        cal_segs = [
+            ((CAL_X1, CAL_Y1, CAL_Z), (CAL_X2, CAL_Y1, CAL_Z), (0, -0.2, -1)),
+            ((CAL_X1, CAL_Y2, CAL_Z), (CAL_X2, CAL_Y2, CAL_Z), (0, 0.2, -1)),
+            ((CAL_X1, CAL_Y1, CAL_Z), (CAL_X1, CAL_Y2, CAL_Z), (0.2, 0, -1)),
+            ((CAL_X2, CAL_Y1, CAL_Z), (CAL_X2, CAL_Y2, CAL_Z), (-0.2, 0, -1)),
+            ((CAL_X1, CAL_Y2 - 0.10, CAL_Z), (CAL_X2, CAL_Y2 - 0.10, CAL_Z), (0, 0, -1)),
+            ((cal_mid_x - 0.08, CAL_Y2, CAL_Z), (cal_mid_x, CAL_Y2 + 0.045, CAL_Z), (0, 0.2, -1)),
+            ((cal_mid_x + 0.08, CAL_Y2, CAL_Z), (cal_mid_x, CAL_Y2 + 0.045, CAL_Z), (0, 0.2, -1)),
+        ]
+        cp, cn = zip(*[_line_pts(a, b, density=140.0, normal=n) for a, b, n in cal_segs])
+        self.cal_frame_pos = np.concatenate(cp, axis=0)
+        self.cal_frame_nrm = np.concatenate(cn, axis=0)
 
         # Restrained scalloped fairy string lights along upper wall trim
         swags = ((-0.98, -0.52), (-0.52, -0.06), (-0.06, 0.40), (1.10, 1.62))
@@ -496,7 +519,7 @@ class RoomSceneModel:
         if max_y > FLOOR_Y + 0.06:
             tongue = 0.72 + 0.28 * np.sin(self.fire_x0 * 34.0 + t * 5.2 + self.fire_phase)
             u_eff = self.fire_u * tongue
-            fy = FLOOR_Y + 0.065 + u_eff * 0.35
+            fy = FLOOR_Y + 0.065 + u_eff * 0.30
             taper = np.clip(1.0 - (self.fire_u ** 0.78), 0.12, 1.0)
             sway = 0.034 * np.sin(t * self.fire_freq + self.fire_phase + self.fire_u * 4.5) * self.fire_u
             fx = FIRE_X + self.fire_x0 * 1.15 * taper + sway
@@ -515,7 +538,7 @@ class RoomSceneModel:
 
             # Subtle rising embers
             su = (self.fp_spark_t0 + t * self.fp_spark_spd) % 1.0
-            sy_s = FLOOR_Y + 0.16 + su * 0.34
+            sy_s = FLOOR_Y + 0.14 + su * 0.28
             sx_s = FIRE_X + self.fp_spark_x0 + 0.025 * np.sin(t * 4.5 + su * 6.0)
             sem = sy_s <= max_y
             if np.any(sem):
@@ -534,6 +557,9 @@ class RoomSceneModel:
             tw_b = 0.45 + 0.65 * (0.5 + 0.5 * np.sin(t * 3.2 + self.wall_bulb_phase[bm]))
             bc = pal_l[self.wall_bulb_cidx[bm] % len(palette.lights)] * tw_b[:, None]
             batches.append(PointBatch(bp, bn, bc.astype(np.float32), (0.6 + 0.6 * tw_b).astype(np.float32)))
+
+        # Small "DEC 25" wall calendar frame
+        add_masked(self.cal_frame_pos, self.cal_frame_nrm, palette.window_frame)
 
         # 3-Part Snowy Window
         add_masked(self.win_frame_pos, self.win_frame_nrm, palette.window_frame)

@@ -18,6 +18,9 @@ import ctypes
 from dataclasses import dataclass
 import math
 import os
+import shutil
+import subprocess
+import sys
 import time
 import numpy as np
 from PIL import Image
@@ -251,6 +254,65 @@ def export_snapshots(
         Image.fromarray(rgb, mode="RGB").save(os.path.join(out_dir, f"{name}.png"))
 
 
+def record_video(
+    director: ChristmasDirector,
+    out_path: str,
+    seconds: float,
+    fps: int,
+    theme_key: str,
+    light_mode: str,
+    snow_on: bool,
+    show_hints: bool,
+) -> None:
+    """Render frames directly into ffmpeg to produce a crisp MP4 video."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg was not found on PATH; install ffmpeg to use --record.")
+
+    total_frames = max(1, int(round(seconds * fps)))
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{WIN_W}x{WIN_H}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "16",
+        "-preset",
+        "medium",
+        out_path,
+    ]
+    print(f"Recording {total_frames} frames ({seconds:.1f}s @ {fps} FPS) -> {out_path}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        for i in range(total_frames):
+            rgb = director.render_at(i / fps, theme_key, light_mode, snow_on, show_hints)
+            proc.stdin.write(rgb.tobytes())
+            if (i + 1) % max(1, fps * 2) == 0 or (i + 1) == total_frames:
+                print(f"  {i + 1}/{total_frames} frames", flush=True)
+    finally:
+        proc.stdin.close()
+        stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg failed (exit {rc}):\n{stderr}")
+
+
 def _enable_dpi_awareness() -> None:
     if os.name != "nt":
         return
@@ -276,6 +338,19 @@ def run_window(args: argparse.Namespace) -> None:
             LIGHT_MODES[mode_idx],
             snow_on,
             show_hints,
+        )
+        return
+
+    if args.record:
+        record_video(
+            director=director,
+            out_path=args.record,
+            seconds=args.record_seconds,
+            fps=args.fps,
+            theme_key=THEME_ORDER[theme_idx],
+            light_mode=LIGHT_MODES[mode_idx],
+            snow_on=snow_on,
+            show_hints=show_hints,
         )
         return
 
@@ -362,6 +437,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fullscreen", action="store_true", help="Launch in fullscreen")
     parser.add_argument("--duration", type=float, default=None, help="Auto-exit after N seconds")
     parser.add_argument("--snapshot-dir", type=str, default=None, help="Export storyboard PNGs and exit")
+    parser.add_argument("--record", type=str, default=None, help="Export directly to MP4 via ffmpeg")
+    parser.add_argument(
+        "--record-seconds",
+        type=float,
+        default=28.0,
+        help="Length in seconds when using --record (default: 28.0)",
+    )
     return parser.parse_args()
 
 

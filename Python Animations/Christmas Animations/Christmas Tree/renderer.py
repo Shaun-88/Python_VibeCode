@@ -6,7 +6,17 @@ import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from scene_models import PointBatch, WINDOW_PANELS, WIN_Z, FLOOR_Y
+from scene_models import (
+    CAL_X1,
+    CAL_X2,
+    CAL_Y1,
+    CAL_Y2,
+    CAL_Z,
+    FLOOR_Y,
+    PointBatch,
+    WINDOW_PANELS,
+    WIN_Z,
+)
 from themes import ThemePalette
 
 WIN_W = 1440
@@ -123,6 +133,13 @@ class AsciiRenderer:
         self.fp_r1 = max(0, int(round(CY - (-0.24 * FOCAL * (CW / CH)) / z_fp)))
         self.fp_r2 = min(SCENE_ROWS - 1, int(round(CY - (FLOOR_Y * FOCAL * (CW / CH)) / z_fp)))
 
+        z_c = CAL_Z - CAM_Z
+        self.cal_c1 = max(0, int(round(CX + (CAL_X1 * FOCAL) / z_c)))
+        self.cal_c2 = min(COLS - 1, int(round(CX + (CAL_X2 * FOCAL) / z_c)))
+        self.cal_r1 = max(0, int(round(CY - (CAL_Y2 * FOCAL * (CW / CH)) / z_c)))
+        self.cal_r2 = min(SCENE_ROWS - 1, int(round(CY - (CAL_Y1 * FOCAL * (CW / CH)) / z_c)))
+        self.cal_mid_r = max(0, int(round(CY - ((CAL_Y2 - 0.10) * FOCAL * (CW / CH)) / z_c)))
+
         self.char_grid = np.zeros((ROWS, COLS), dtype=np.int32)
         self.col_grid = np.zeros((ROWS, COLS, 3), dtype=np.float32)
         self.glow_grid = np.zeros((ROWS, COLS, 3), dtype=np.float32)
@@ -229,6 +246,27 @@ class AsciiRenderer:
                 b_col = (1.0 * alpha, 0.94 * alpha, 0.62 * alpha)
                 self._draw_text_row(row_s, col_s, text, b_col, glow=0.70 * alpha)
 
+        # 2b. Small "DEC 25" wall calendar lettering on the upper-right wall
+        if room_reveal > 0.45:
+            cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
+            cal_cx = (self.cal_c1 + self.cal_c2) // 2
+            hdr_r = (self.cal_r1 + self.cal_mid_r) // 2
+            if hdr_r >= cut_row:
+                self._draw_text_row(hdr_r, cal_cx - 2, "D E C", (0.98, 0.96, 0.92), glow=0.15)
+            digits_25 = (
+                "###  ###",
+                "  #  #  ",
+                "###  ###",
+                "#      #",
+                "###  ###",
+            )
+            d_r0 = self.cal_mid_r + 1
+            d_c0 = cal_cx - len(digits_25[0]) // 2 + 1
+            for dr, d_line in enumerate(digits_25):
+                rr = d_r0 + dr
+                if rr < self.cal_r2 and rr >= cut_row:
+                    self._draw_text_row(rr, d_c0, d_line, palette.banner_b, glow=0.25)
+
         # 3. Crisp ASCII-shaded "MERRY CHRISTMAS" banner in bottom dark apron (rows 67..71)
         if title_reveal > 0.0:
             mr, mc = self.banner_mask.shape
@@ -284,6 +322,19 @@ class AsciiRenderer:
             if self.fp_r2 > fr1:
                 bg_cells[fr1 : self.fp_r2 + 1, self.fp_c1 : self.fp_c2 + 1, :] = np.array(
                     (0.09, 0.025, 0.010), dtype=np.float32
+                )
+
+        if room_reveal > 0.45:
+            cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
+            cr1 = max(self.cal_r1 + 1, cut_row)
+            cm1 = max(self.cal_mid_r + 1, cut_row)
+            if self.cal_mid_r - 1 >= cr1:
+                bg_cells[cr1 : self.cal_mid_r, self.cal_c1 + 1 : self.cal_c2, :] = np.array(
+                    (0.32, 0.05, 0.07), dtype=np.float32
+                )
+            if self.cal_r2 - 1 >= cm1:
+                bg_cells[cm1 : self.cal_r2, self.cal_c1 + 1 : self.cal_c2, :] = np.array(
+                    (0.11, 0.11, 0.14), dtype=np.float32
                 )
 
         # Fill background across active raster, then composite only non-space cells
