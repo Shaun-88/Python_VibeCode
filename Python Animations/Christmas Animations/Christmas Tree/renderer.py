@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+import pygame
 
 from scene_models import (
     CAL_X1,
@@ -77,7 +78,13 @@ def _find_monospace_font() -> str | None:
 def _build_glyph_atlas() -> np.ndarray:
     """Pre-rasterize crisp Consolas glyphs into a (N_CHARS, CH, CW) float32 atlas."""
     font_path = _find_monospace_font()
-    font = ImageFont.truetype(font_path, 11) if font_path else ImageFont.load_default()
+    if font_path:
+        font = ImageFont.truetype(font_path, 11)
+    else:
+        try:
+            font = ImageFont.load_default(size=11)
+        except TypeError:
+            font = ImageFont.load_default()
 
     atlas = np.zeros((len(ATLAS_CHARS), CH, CW), dtype=np.float32)
     for idx, ch in enumerate(ATLAS_CHARS):
@@ -148,6 +155,18 @@ class AsciiRenderer:
         self.oy = (WIN_H - ROWS * CH) // 2
         self.ox = (WIN_W - COLS * CW) // 2
 
+        self.atlas_flat = np.ascontiguousarray(self.atlas.reshape(len(ATLAS_CHARS), CH * CW, 1))
+        self._blend_buf = np.empty((ROWS * COLS, CH * CW, 3), dtype=np.float32)
+        self._blend_u8 = np.empty((ROWS * COLS, CH * CW, 3), dtype=np.uint8)
+        self._raster = self.out_frame[self.oy : self.oy + ROWS * CH, self.ox : self.ox + COLS * CW]
+        self._raster_view = self._raster.reshape(ROWS, CH, COLS, CW, 3)
+        self._s_out = pygame.image.frombuffer(self.out_frame.data, (WIN_W, WIN_H), "RGB")
+        self._bloom_buf = np.empty((ROWS * CH, COLS * CW, 3), dtype=np.uint8)
+        self._s_bloom = pygame.image.frombuffer(self._bloom_buf.data, (COLS * CW, ROWS * CH), "RGB")
+        self._bg_grad_cache: dict[str, np.ndarray] = {}
+        self._bg_cell_cache: dict[str, np.ndarray] = {}
+        self._bg_raster_cache: dict[str, np.ndarray] = {}
+
     @staticmethod
     def project_point(world_pt: np.ndarray) -> tuple[int, int] | None:
         z = float(world_pt[2]) - CAM_Z
@@ -177,6 +196,72 @@ class AsciiRenderer:
                 if glow > 0.0:
                     self.glow_grid[row, c] = np.array(rgb, dtype=np.float32) * glow
 
+    def _build_bg_cells(self, palette: ThemePalette, room_reveal: float) -> np.ndarray:
+        grad = self._bg_grad_cache.get(palette.name)
+        if grad is None:
+            bg_top = np.array(palette.bg_top, dtype=np.float32)[None, None, :]
+            bg_bot = np.array(palette.bg_bottom, dtype=np.float32)[None, None, :]
+            bg_col = bg_top * (np.float32(1.0) - self.y_grad) + bg_bot * self.y_grad
+            grad = np.broadcast_to(bg_col, (ROWS, COLS, 3)).copy()
+            grad[SCENE_ROWS:, :, :] *= np.float32(0.40)
+            self._bg_grad_cache[palette.name] = grad
+
+        bg_cells = grad.copy()
+        if room_reveal > 0.35:
+            win_cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
+            wt = np.array(palette.window_sky_top, dtype=np.float32)[None, None, :]
+            wb = np.array(palette.window_sky_bot, dtype=np.float32)[None, None, :]
+            for c1, c2, wr1, wr2 in self.win_rects:
+                r1 = max(wr1, win_cut_row)
+                if wr2 > r1:
+                    w_grad = np.linspace(0.0, 1.0, wr2 - r1 + 1, dtype=np.float32)[:, None, None]
+                    bg_cells[r1 : wr2 + 1, c1 : c2 + 1, :] = wt * (np.float32(1.0) - w_grad) + wb * w_grad
+
+        if room_reveal > 0.10:
+            cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
+            fr1 = max(self.fp_r1, cut_row)
+            if self.fp_r2 > fr1:
+                bg_cells[fr1 : self.fp_r2 + 1, self.fp_c1 : self.fp_c2 + 1, :] = np.array(
+                    (0.09, 0.025, 0.010), dtype=np.float32
+                )
+
+        if room_reveal > 0.45:
+            cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
+            cr1 = max(self.cal_r1 + 1, cut_row)
+            cm1 = max(self.cal_mid_r + 1, cut_row)
+            if self.cal_mid_r - 1 >= cr1:
+                bg_cells[cr1 : self.cal_mid_r, self.cal_c1 + 1 : self.cal_c2, :] = np.array(
+                    (0.32, 0.05, 0.07), dtype=np.float32
+                )
+            if self.cal_r2 - 1 >= cm1:
+                bg_cells[cm1 : self.cal_r2, self.cal_c1 + 1 : self.cal_c2, :] = np.array(
+                    (0.11, 0.11, 0.14), dtype=np.float32
+                )
+        return bg_cells
+
+    def _fill_background(self, palette: ThemePalette, room_reveal: float) -> np.ndarray:
+        if room_reveal >= 1.0:
+            bg_cells = self._bg_cell_cache.get(palette.name)
+            bg_raster = self._bg_raster_cache.get(palette.name)
+            if bg_cells is not None and bg_raster is not None:
+                np.copyto(self._raster, bg_raster)
+                return bg_cells
+            bg_cells = self._build_bg_cells(palette, 1.0)
+            bg_u8 = np.clip(bg_cells * np.float32(255.0), 0.0, 255.0).astype(np.uint8)
+            s_bg = pygame.image.frombuffer(bg_u8.data, (COLS, ROWS), "RGB")
+            pygame.transform.scale(s_bg, (COLS * CW, ROWS * CH), self._s_bloom)
+            self._s_out.blit(self._s_bloom, (self.ox, self.oy))
+            self._bg_cell_cache[palette.name] = bg_cells
+            self._bg_raster_cache[palette.name] = self._raster.copy()
+            return bg_cells
+
+        bg_cells = self._build_bg_cells(palette, room_reveal)
+        bg_u8 = np.clip(bg_cells * np.float32(255.0), 0.0, 255.0).astype(np.uint8)
+        s_bg = pygame.image.frombuffer(bg_u8.data, (COLS, ROWS), "RGB")
+        pygame.transform.scale(s_bg, (COLS * CW, ROWS * CH), self._s_bloom)
+        self._s_out.blit(self._s_bloom, (self.ox, self.oy))
+        return bg_cells
+
     def render_frame(
         self,
         batch: PointBatch,
@@ -189,7 +274,11 @@ class AsciiRenderer:
         light_mode: str,
         snow_on: bool,
     ) -> np.ndarray:
-        """Render complete (WIN_H, WIN_W, 3) uint8 RGB frame ready for display."""
+        """Render complete (WIN_H, WIN_W, 3) uint8 RGB frame ready for display.
+
+        Returns an internal reused frame buffer (`self.out_frame`); callers retaining
+        frames across multiple calls should call `.copy()`.
+        """
         self.char_grid.fill(0)
         self.col_grid.fill(0.0)
         self.glow_grid.fill(0.0)
@@ -286,13 +375,13 @@ class AsciiRenderer:
                 self.col_grid[r0 + rr, c0 + cols_on] = rgb_arr
                 self.glow_grid[r0 + rr, c0 + cols_on] = rgb_arr * 0.38
 
-        # 4. Subtle bottom control bar (toggleable with H)
+        # 4. Subtle bottom control bar (hidden by default; toggleable with C)
         if show_hints:
             hint = (
                 f"[1-3] {palette.name}   "
                 f"[M] Lights: {light_mode.capitalize()}   "
                 f"[S] Snow: {'On' if snow_on else 'Off'}   "
-                f"[H] Hide UI   "
+                f"[C] Hide UI   "
                 f"[F] Fullscreen   "
                 f"[R] Replay   "
                 f"[Q] Quit"
@@ -300,62 +389,27 @@ class AsciiRenderer:
             self._draw_text_row(ROWS - 1, max(0, (COLS - len(hint)) // 2), hint, (0.44, 0.49, 0.60))
 
         # 5. Deep night backdrop + midnight window glass + sharp glyph compositing
-        bg_top = np.array(palette.bg_top, dtype=np.float32)[None, None, :]
-        bg_bot = np.array(palette.bg_bottom, dtype=np.float32)[None, None, :]
-        bg_col = bg_top * (1.0 - self.y_grad) + bg_bot * self.y_grad
-        bg_cells = np.broadcast_to(bg_col, (ROWS, COLS, 3)).copy()
-        bg_cells[SCENE_ROWS:, :, :] *= 0.40
-
-        if room_reveal > 0.35:
-            win_cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
-            wt = np.array(palette.window_sky_top, dtype=np.float32)[None, None, :]
-            wb = np.array(palette.window_sky_bot, dtype=np.float32)[None, None, :]
-            for c1, c2, wr1, wr2 in self.win_rects:
-                r1 = max(wr1, win_cut_row)
-                if wr2 > r1:
-                    w_grad = np.linspace(0.0, 1.0, wr2 - r1 + 1, dtype=np.float32)[:, None, None]
-                    bg_cells[r1 : wr2 + 1, c1 : c2 + 1, :] = wt * (1.0 - w_grad) + wb * w_grad
-
-        if room_reveal > 0.10:
-            cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
-            fr1 = max(self.fp_r1, cut_row)
-            if self.fp_r2 > fr1:
-                bg_cells[fr1 : self.fp_r2 + 1, self.fp_c1 : self.fp_c2 + 1, :] = np.array(
-                    (0.09, 0.025, 0.010), dtype=np.float32
-                )
-
-        if room_reveal > 0.45:
-            cut_row = int(round(SCENE_ROWS * (1.0 - room_reveal)))
-            cr1 = max(self.cal_r1 + 1, cut_row)
-            cm1 = max(self.cal_mid_r + 1, cut_row)
-            if self.cal_mid_r - 1 >= cr1:
-                bg_cells[cr1 : self.cal_mid_r, self.cal_c1 + 1 : self.cal_c2, :] = np.array(
-                    (0.32, 0.05, 0.07), dtype=np.float32
-                )
-            if self.cal_r2 - 1 >= cm1:
-                bg_cells[cm1 : self.cal_r2, self.cal_c1 + 1 : self.cal_c2, :] = np.array(
-                    (0.11, 0.11, 0.14), dtype=np.float32
-                )
-
-        # Fill background across active raster, then composite only non-space cells
-        raster = self.out_frame[self.oy : self.oy + ROWS * CH, self.ox : self.ox + COLS * CW]
-        view = raster.reshape(ROWS, CH, COLS, CW, 3)
-        view[:, :, :, :, :] = np.clip(bg_cells[:, None, :, None, :] * 255.0, 0.0, 255.0).astype(np.uint8)
+        bg_cells = self._fill_background(palette, room_reveal)
 
         rr, cc = np.nonzero(self.char_grid)
-        if len(rr) > 0:
-            a = self.atlas[self.char_grid[rr, cc]][:, :, :, None]
-            fg = self.col_grid[rr, cc][:, None, None, :]
-            bg = bg_cells[rr, cc][:, None, None, :]
-            blended = np.clip((bg + (fg - bg) * a) * 255.0, 0.0, 255.0).astype(np.uint8)
-            view[rr, :, cc, :, :] = blended
+        n_cells = len(rr)
+        if n_cells > 0:
+            fg = self.col_grid[rr, cc] * np.float32(255.0)
+            bg = bg_cells[rr, cc] * np.float32(255.0)
+            diff = (fg - bg)[:, None, :]
+            buf = self._blend_buf[:n_cells]
+            buf_u8 = self._blend_u8[:n_cells]
+            np.matmul(self.atlas_flat[self.char_grid[rr, cc]], diff, out=buf)
+            np.add(buf, bg[:, None, :], out=buf)
+            np.clip(buf, 0.0, 255.0, out=buf)
+            np.copyto(buf_u8, buf, casting="unsafe")
+            self._raster_view[rr, :, cc, :, :] = buf_u8.reshape(n_cells, CH, CW, 3)
 
-        # Fast cell-grid bloom blurred and saturating-added in uint8
-        glow_u8 = np.clip(self.glow_grid * 115.0, 0.0, 255.0).astype(np.uint8)
+        # Fast cell-grid bloom blurred cleanly in PIL and SDL2-added in place
+        glow_u8 = np.clip(self.glow_grid * np.float32(115.0), 0.0, 255.0).astype(np.uint8)
         pil_glow = Image.fromarray(glow_u8, mode="RGB").filter(ImageFilter.GaussianBlur(radius=1.3))
-        bloom_u8 = np.asarray(
-            pil_glow.resize((COLS * CW, ROWS * CH), Image.Resampling.BILINEAR),
-            dtype=np.uint8,
-        )
-        raster += np.minimum(bloom_u8, 255 - raster)
+        glow_blur = np.ascontiguousarray(pil_glow, dtype=np.uint8)
+        s_glow = pygame.image.frombuffer(glow_blur.data, (COLS, ROWS), "RGB")
+        pygame.transform.smoothscale(s_glow, (COLS * CW, ROWS * CH), self._s_bloom)
+        self._s_out.blit(self._s_bloom, (self.ox, self.oy), special_flags=pygame.BLEND_RGB_ADD)
         return self.out_frame

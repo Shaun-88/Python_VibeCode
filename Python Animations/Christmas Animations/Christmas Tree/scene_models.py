@@ -405,34 +405,105 @@ class RoomSceneModel:
         self.snow_phase = rng.uniform(0.0, math.tau, n_snow).astype(np.float32)
         self.snow_emit = rng.uniform(0.58, 0.92, n_snow).astype(np.float32)
 
-    def _apply_room_glow(
-        self,
-        pos: np.ndarray,
-        base_col: np.ndarray,
-        palette: ThemePalette,
-        tree_glow: float,
-        fire_flicker: float,
-    ) -> np.ndarray:
-        if len(pos) == 0:
-            return base_col
-        out = base_col
-        if tree_glow > 0.0:
-            dx = (pos[:, 0] - TREE_X) * 0.85
-            dy = (pos[:, 1] - (FLOOR_Y + 0.62)) * 0.95
-            dz = (pos[:, 2] - TREE_Z) * 0.85
-            dist = np.sqrt(dx * dx + dy * dy + dz * dz)
-            w = np.clip(1.0 - dist / 1.70, 0.0, 1.0) ** 2 * (0.40 * tree_glow)
-            warm_t = np.array(palette.garland, dtype=np.float32)[None, :]
-            out = out * (1.0 - w[:, None]) + warm_t * w[:, None]
-        if fire_flicker > 0.0:
-            dx = (pos[:, 0] - FIRE_X) * 0.95
-            dy = (pos[:, 1] - (FLOOR_Y + 0.25)) * 1.1
-            dz = (pos[:, 2] - (BACK_WALL_Z - 0.15)) * 0.95
-            dist = np.sqrt(dx * dx + dy * dy + dz * dz)
-            wf = np.clip(1.0 - dist / 1.15, 0.0, 1.0) ** 2 * (0.50 * fire_flicker)
-            warm_f = np.array(palette.fire_glow, dtype=np.float32)[None, :]
-            out = out * (1.0 - wf[:, None]) + warm_f * wf[:, None]
-        return out
+        # Pre-pack static room geometry + precomputed glow weights (keeps all normals float32)
+        self.win_snow_drift_nrm = np.tile(
+            np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            (len(self.win_snow_drift), 1),
+        )
+        static_specs = [
+            ("floor_fill", self.floor_fill_pos, self.floor_fill_nrm, 0.0, True),
+            ("floor_line", self.floor_line_pos, self.floor_line_nrm, 0.0, True),
+            ("rug", self.rug_pos, self.rug_nrm, 0.0, True),
+            ("wall_fill", self.wall_fill_pos, self.wall_fill_nrm, 0.0, True),
+            ("wall_line", self.wall_line_pos, self.wall_line_nrm, 0.0, True),
+            ("fp_brick_fill", self.fp_brick_fill_pos, self.fp_brick_fill_nrm, 0.0, True),
+            ("fp_brick", self.fp_brick_pos, self.fp_brick_nrm, 0.0, True),
+            ("fp_mantel", self.fp_mantel_pos, self.fp_mantel_nrm, 0.0, True),
+            ("fp_log", self.fp_log_pos, self.fp_log_nrm, 0.0, False),
+            ("wreath", self.wreath_pos, self.wreath_nrm, np.where(self.wreath_is_bow, 0.25, 0.08).astype(np.float32), False),
+            ("stocking", self.stocking_pos, self.stocking_nrm, 0.16, False),
+            ("wire", self.wire_pos, self.wire_nrm, 0.0, False),
+            ("cal_frame", self.cal_frame_pos, self.cal_frame_nrm, 0.0, True),
+            ("win_frame", self.win_frame_pos, self.win_frame_nrm, 0.0, True),
+            ("moon", self.moon_pos, self.moon_nrm, 0.90, False),
+            ("win_snow", self.win_snow_drift, self.win_snow_drift_nrm, 0.22, False),
+        ]
+        self._static_slices: list[tuple[str, int, int]] = []
+        pos_l, nrm_l, emit_l, tint_l = [], [], [], []
+        off = 0
+        for tag, sp, sn, se, st in static_specs:
+            n_s = len(sp)
+            pos_l.append(sp.astype(np.float32, copy=False))
+            nrm_l.append(sn.astype(np.float32, copy=False))
+            if isinstance(se, np.ndarray):
+                emit_l.append(se.astype(np.float32, copy=False))
+            else:
+                emit_l.append(np.full(n_s, se, dtype=np.float32))
+            tint_l.append(np.full(n_s, st, dtype=bool))
+            self._static_slices.append((tag, off, off + n_s))
+            off += n_s
+
+        self._static_pos = np.concatenate(pos_l, axis=0)
+        self._static_nrm = np.concatenate(nrm_l, axis=0)
+        self._static_emit = np.concatenate(emit_l, axis=0)
+        self._static_tint = np.concatenate(tint_l, axis=0)
+        self._static_w_tree, self._static_w_fire = self._compute_glow_weights(self._static_pos)
+        self._static_col_cache: dict[str, np.ndarray] = {}
+
+    @staticmethod
+    def _compute_glow_weights(pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        dx_t = (pos[:, 0] - TREE_X) * 0.85
+        dy_t = (pos[:, 1] - (FLOOR_Y + 0.62)) * 0.95
+        dz_t = (pos[:, 2] - TREE_Z) * 0.85
+        dist_t = np.sqrt(dx_t * dx_t + dy_t * dy_t + dz_t * dz_t)
+        w_tree = (np.clip(1.0 - dist_t / 1.70, 0.0, 1.0) ** 2 * 0.40).astype(np.float32)
+
+        dx_f = (pos[:, 0] - FIRE_X) * 0.95
+        dy_f = (pos[:, 1] - (FLOOR_Y + 0.25)) * 1.1
+        dz_f = (pos[:, 2] - (BACK_WALL_Z - 0.15)) * 0.95
+        dist_f = np.sqrt(dx_f * dx_f + dy_f * dy_f + dz_f * dz_f)
+        w_fire = (np.clip(1.0 - dist_f / 1.15, 0.0, 1.0) ** 2 * 0.50).astype(np.float32)
+        return w_tree, w_fire
+
+    def _get_static_base_colors(self, palette: ThemePalette) -> np.ndarray:
+        cached = self._static_col_cache.get(palette.name)
+        if cached is not None:
+            return cached
+        col = np.empty((len(self._static_pos), 3), dtype=np.float32)
+        flat_map = {
+            "floor_fill": palette.floor_fill,
+            "floor_line": palette.floor_line,
+            "wall_fill": palette.wall_fill,
+            "wall_line": palette.wall_line,
+            "fp_brick_fill": tuple(c * 0.58 for c in palette.hearth_brick),
+            "fp_brick": palette.hearth_brick,
+            "fp_mantel": palette.hearth_mantel,
+            "fp_log": (0.28, 0.14, 0.08),
+            "wire": palette.wall_line,
+            "cal_frame": palette.window_frame,
+            "win_frame": palette.window_frame,
+            "moon": palette.moon,
+            "win_snow": (0.76, 0.85, 0.98),
+        }
+        for tag, s, e in self._static_slices:
+            if tag in flat_map:
+                col[s:e] = np.array(flat_map[tag], dtype=np.float32)
+            elif tag == "rug":
+                col[s:e] = np.where(
+                    self.rug_is_border[:, None],
+                    np.array(palette.rug_outer, dtype=np.float32),
+                    np.array(palette.rug_inner, dtype=np.float32),
+                )
+            elif tag == "wreath":
+                col[s:e] = np.where(
+                    self.wreath_is_bow[:, None],
+                    np.array((0.92, 0.16, 0.20), dtype=np.float32),
+                    np.array(palette.pine_bright, dtype=np.float32) * 0.78,
+                )
+            elif tag == "stocking":
+                col[s:e] = self.stocking_col
+        self._static_col_cache[palette.name] = col
+        return col
 
     def build_batch(
         self,
@@ -449,71 +520,35 @@ class RoomSceneModel:
         fire_flicker = (0.78 + 0.22 * math.sin(t * 7.3) * math.cos(t * 3.1)) * clamp01(room_reveal * 2.5)
         batches: list[PointBatch] = []
 
-        def add_masked(
-            pos: np.ndarray,
-            nrm: np.ndarray,
-            rgb: tuple[float, float, float],
-            emit: float = 0.0,
-            tint_glow: bool = True,
-        ) -> None:
-            mask = pos[:, 1] <= max_y
-            if not np.any(mask):
-                return
-            p = pos[mask]
-            n = nrm[mask]
-            c = np.tile(np.array(rgb, dtype=np.float32), (len(p), 1))
-            if tint_glow:
-                c = self._apply_room_glow(p, c, palette, tree_glow, fire_flicker)
-            e = np.full(len(p), emit, dtype=np.float32)
-            batches.append(PointBatch(p, n, c, e))
+        base_col = self._get_static_base_colors(palette)
+        if room_reveal >= 1.0:
+            sp = self._static_pos
+            sn = self._static_nrm
+            se = self._static_emit
+            st_tint = self._static_tint
+            wt = self._static_w_tree
+            wf = self._static_w_fire
+            sc = base_col.copy()
+        else:
+            sm = self._static_pos[:, 1] <= max_y
+            sp = self._static_pos[sm]
+            sn = self._static_nrm[sm]
+            se = self._static_emit[sm]
+            st_tint = self._static_tint[sm]
+            wt = self._static_w_tree[sm]
+            wf = self._static_w_fire[sm]
+            sc = base_col[sm]
 
-        add_masked(self.floor_fill_pos, self.floor_fill_nrm, palette.floor_fill)
-        add_masked(self.floor_line_pos, self.floor_line_nrm, palette.floor_line)
-
-        rug_mask = self.rug_pos[:, 1] <= max_y
-        if np.any(rug_mask):
-            rp = self.rug_pos[rug_mask]
-            rn = self.rug_nrm[rug_mask]
-            rb = self.rug_is_border[rug_mask]
-            rc = np.where(
-                rb[:, None],
-                np.array(palette.rug_outer, dtype=np.float32),
-                np.array(palette.rug_inner, dtype=np.float32),
-            )
-            rc = self._apply_room_glow(rp, rc, palette, tree_glow, fire_flicker)
-            batches.append(PointBatch(rp, rn, rc, np.zeros(len(rp), dtype=np.float32)))
-
-        add_masked(self.wall_fill_pos, self.wall_fill_nrm, palette.wall_fill)
-        add_masked(self.wall_line_pos, self.wall_line_nrm, palette.wall_line)
-
-        # Fireplace bricks, mantel, wreath, stockings, logs & flickering 3D fire
-        add_masked(self.fp_brick_fill_pos, self.fp_brick_fill_nrm, tuple(c * 0.58 for c in palette.hearth_brick))
-        add_masked(self.fp_brick_pos, self.fp_brick_nrm, palette.hearth_brick)
-        add_masked(self.fp_mantel_pos, self.fp_mantel_nrm, palette.hearth_mantel)
-        add_masked(self.fp_log_pos, self.fp_log_nrm, (0.28, 0.14, 0.08), tint_glow=False)
-
-        wm = self.wreath_pos[:, 1] <= max_y
-        if np.any(wm):
-            wp_m = self.wreath_pos[wm]
-            wn_m = self.wreath_nrm[wm]
-            wb_m = self.wreath_is_bow[wm]
-            wc = np.where(
-                wb_m[:, None],
-                np.array((0.92, 0.16, 0.20), dtype=np.float32),
-                np.array(palette.pine_bright, dtype=np.float32) * 0.78,
-            )
-            batches.append(PointBatch(wp_m, wn_m, wc, np.where(wb_m, 0.25, 0.08).astype(np.float32)))
-
-        sm = self.stocking_pos[:, 1] <= max_y
-        if np.any(sm):
-            batches.append(
-                PointBatch(
-                    self.stocking_pos[sm],
-                    self.stocking_nrm[sm],
-                    self.stocking_col[sm],
-                    np.full(int(sm.sum()), 0.16, dtype=np.float32),
-                )
-            )
+        if len(sp) > 0:
+            if tree_glow > 0.0:
+                w = (wt * st_tint * np.float32(tree_glow))[:, None]
+                warm_t = np.array(palette.garland, dtype=np.float32)[None, :]
+                sc = sc * (1.0 - w) + warm_t * w
+            if fire_flicker > 0.0:
+                wf_s = (wf * st_tint * np.float32(fire_flicker))[:, None]
+                warm_f = np.array(palette.fire_glow, dtype=np.float32)[None, :]
+                sc = sc * (1.0 - wf_s) + warm_f * wf_s
+            batches.append(PointBatch(sp, sn, sc, se))
 
         # Animated dancing flames inside firebox (natural tapered flame silhouette)
         if max_y > FLOOR_Y + 0.06:
@@ -529,7 +564,6 @@ class RoomSceneModel:
                 u_f = self.fire_u[fm]
                 fp_pos = np.stack([fx[fm], fy[fm], fz[fm]], axis=1)
                 fp_nrm = np.tile(np.array([0.0, 0.3, -0.95], dtype=np.float32), (len(fp_pos), 1))
-                # Deep orange-red core -> warm amber -> bright golden flame tips
                 col_bot = np.array((1.00, 0.30, 0.06), dtype=np.float32)[None, :]
                 col_top = np.array((1.00, 0.90, 0.28), dtype=np.float32)[None, :]
                 fc = col_bot * (1.0 - u_f[:, None]) + col_top * u_f[:, None]
@@ -548,7 +582,6 @@ class RoomSceneModel:
                 batches.append(PointBatch(sp_pos, sp_nrm, sp_col, (1.1 * (1.0 - su[sem])).astype(np.float32)))
 
         # Upper wall fairy string lights
-        add_masked(self.wire_pos, self.wire_nrm, palette.wall_line, tint_glow=False)
         bm = self.wall_bulb_pos[:, 1] <= max_y
         if np.any(bm):
             bp = self.wall_bulb_pos[bm]
@@ -558,27 +591,13 @@ class RoomSceneModel:
             bc = pal_l[self.wall_bulb_cidx[bm] % len(palette.lights)] * tw_b[:, None]
             batches.append(PointBatch(bp, bn, bc.astype(np.float32), (0.6 + 0.6 * tw_b).astype(np.float32)))
 
-        # Small "DEC 25" wall calendar frame
-        add_masked(self.cal_frame_pos, self.cal_frame_nrm, palette.window_frame)
-
-        # 3-Part Snowy Window
-        add_masked(self.win_frame_pos, self.win_frame_nrm, palette.window_frame)
-        add_masked(self.moon_pos, self.moon_nrm, palette.moon, emit=0.90, tint_glow=False)
-        add_masked(
-            self.win_snow_drift,
-            np.tile([0.0, 0.0, -1.0], (len(self.win_snow_drift), 1)),
-            (0.76, 0.85, 0.98),
-            emit=0.22,
-            tint_glow=False,
-        )
-
         star_mask = self.star_pos[:, 1] <= max_y
         if np.any(star_mask):
-            sp = self.star_pos[star_mask]
+            sp_st = self.star_pos[star_mask]
             tw = 0.45 + 0.55 * np.sin(t * 2.2 + self.star_phase[star_mask])
-            sc = np.array([0.82, 0.90, 1.00], dtype=np.float32)[None, :] * tw[:, None]
-            sn = np.tile(np.array([0.0, 0.2, 0.8], dtype=np.float32), (len(sp), 1))
-            batches.append(PointBatch(sp, sn, sc, tw.astype(np.float32) * 0.55))
+            sc_st = np.array([0.82, 0.90, 1.00], dtype=np.float32)[None, :] * tw[:, None]
+            sn_st = np.tile(np.array([0.0, 0.2, 0.8], dtype=np.float32), (len(sp_st), 1))
+            batches.append(PointBatch(sp_st, sn_st, sc_st.astype(np.float32), (tw * 0.55).astype(np.float32)))
 
         if snow_on:
             sy = self.snow_y1 + np.mod(self.snow_y - self.snow_y1 - t * self.snow_speed, (self.snow_y2 - self.snow_y1))
@@ -727,6 +746,42 @@ class TreeModel:
         self.star_nrm = np.stack([sx * 2.0, sy * 2.0, np.where(sz >= 0, 1.0, -1.0)], axis=1).astype(np.float32)
         self.star_nrm /= np.linalg.norm(self.star_nrm, axis=1, keepdims=True) + 1e-8
 
+        # Pre-pack rigid rotating tree geometry (trunk + inner core + needles + baubles)
+        self._rigid_pos = np.concatenate(
+            [self.trunk_pos, self.inner_pos, self.needle_pos, self.bauble_pos],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        self._rigid_nrm = np.concatenate(
+            [self.trunk_nrm, self.inner_nrm, self.needle_nrm, self.bauble_nrm],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        self._rigid_emit = np.concatenate([
+            np.where(self.trunk_is_stand, 0.15, 0.12).astype(np.float32),
+            np.zeros(len(self.inner_pos) + len(self.needle_pos), dtype=np.float32),
+            np.full(len(self.bauble_pos), 0.28, dtype=np.float32),
+        ])
+        self._rigid_col_cache: dict[str, np.ndarray] = {}
+
+    def _get_rigid_colors(self, palette: ThemePalette) -> np.ndarray:
+        cached = self._rigid_col_cache.get(palette.name)
+        if cached is not None:
+            return cached
+        tc = np.where(
+            self.trunk_is_stand[:, None],
+            np.array(palette.rug_outer, dtype=np.float32),
+            np.array(palette.trunk, dtype=np.float32),
+        )
+        ic = np.tile(np.array(palette.pine_dark, dtype=np.float32) * 0.72, (len(self.inner_pos), 1))
+        s = self.needle_shade[:, None]
+        c_dark = np.array(palette.pine_dark, dtype=np.float32)[None, :]
+        c_bright = np.array(palette.pine_bright, dtype=np.float32)[None, :]
+        nc = c_dark * (np.float32(1.0) - s) + c_bright * s
+        pal_arr = np.array(palette.baubles, dtype=np.float32)
+        bc = pal_arr[self.bauble_cidx % len(palette.baubles)]
+        col = np.concatenate([tc, ic, nc, bc], axis=0).astype(np.float32, copy=False)
+        self._rigid_col_cache[palette.name] = col
+        return col
+
     def build_batch(
         self,
         palette: ThemePalette,
@@ -750,55 +805,59 @@ class TreeModel:
         def to_world(local_p: np.ndarray, local_n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             return (local_p @ R.T) + center[None, :], (local_n @ R.T)
 
-        trunk_cut = (self.TRUNK_TOP + 0.06) * trunk_grow
-        tm = self.trunk_pos[:, 1] <= trunk_cut
-        if np.any(tm):
-            tp, tn = to_world(self.trunk_pos[tm], self.trunk_nrm[tm])
-            is_s = self.trunk_is_stand[tm]
-            tc = np.where(
-                is_s[:, None],
-                np.array(palette.rug_outer, dtype=np.float32),
-                np.array(palette.trunk, dtype=np.float32),
-            )
-            te = np.where(is_s, 0.15, 0.12).astype(np.float32)
-            batches.append(PointBatch(tp, tn, tc, te))
+        if trunk_grow >= 1.0 and tree_grow >= 1.0 and ornament_grow >= 1.0:
+            rp, rn = to_world(self._rigid_pos, self._rigid_nrm)
+            batches.append(PointBatch(rp, rn, self._get_rigid_colors(palette), self._rigid_emit))
+        else:
+            trunk_cut = (self.TRUNK_TOP + 0.06) * trunk_grow
+            tm = self.trunk_pos[:, 1] <= trunk_cut
+            if np.any(tm):
+                tp, tn = to_world(self.trunk_pos[tm], self.trunk_nrm[tm])
+                is_s = self.trunk_is_stand[tm]
+                tc = np.where(
+                    is_s[:, None],
+                    np.array(palette.rug_outer, dtype=np.float32),
+                    np.array(palette.trunk, dtype=np.float32),
+                )
+                te = np.where(is_s, 0.15, 0.12).astype(np.float32)
+                batches.append(PointBatch(tp, tn, tc, te))
 
-        if tree_grow <= 0.0:
-            return concat_batches(batches)
+            if tree_grow <= 0.0:
+                return concat_batches(batches)
 
-        tree_cut = 0.27 + (1.46 - 0.27) * tree_grow
+            tree_cut = 0.27 + (1.46 - 0.27) * tree_grow
 
-        im = self.inner_pos[:, 1] <= tree_cut
-        if np.any(im):
-            ip, inn = to_world(self.inner_pos[im], self.inner_nrm[im])
-            ic = np.tile(np.array(palette.pine_dark, dtype=np.float32) * 0.72, (len(ip), 1))
-            batches.append(PointBatch(ip, inn, ic, np.zeros(len(ip), dtype=np.float32)))
+            im = self.inner_pos[:, 1] <= tree_cut
+            if np.any(im):
+                ip, inn = to_world(self.inner_pos[im], self.inner_nrm[im])
+                ic = np.tile(np.array(palette.pine_dark, dtype=np.float32) * 0.72, (len(ip), 1))
+                batches.append(PointBatch(ip, inn, ic, np.zeros(len(ip), dtype=np.float32)))
 
-        nm = self.needle_pos[:, 1] <= tree_cut
-        if np.any(nm):
-            np_pos, np_nrm = to_world(self.needle_pos[nm], self.needle_nrm[nm])
-            s = self.needle_shade[nm][:, None]
-            c_dark = np.array(palette.pine_dark, dtype=np.float32)[None, :]
-            c_bright = np.array(palette.pine_bright, dtype=np.float32)[None, :]
-            nc = c_dark * (1.0 - s) + c_bright * s
-            batches.append(PointBatch(np_pos, np_nrm, nc, np.zeros(len(np_pos), dtype=np.float32)))
+            nm = self.needle_pos[:, 1] <= tree_cut
+            if np.any(nm):
+                np_pos, np_nrm = to_world(self.needle_pos[nm], self.needle_nrm[nm])
+                s = self.needle_shade[nm][:, None]
+                c_dark = np.array(palette.pine_dark, dtype=np.float32)[None, :]
+                c_bright = np.array(palette.pine_bright, dtype=np.float32)[None, :]
+                nc = c_dark * (np.float32(1.0) - s) + c_bright * s
+                batches.append(PointBatch(np_pos, np_nrm, nc, np.zeros(len(np_pos), dtype=np.float32)))
+
+            if ornament_grow > 0.0:
+                orn_cut = 0.29 + (1.40 - 0.29) * ornament_grow
+                bm = self.bauble_y <= orn_cut
+                if np.any(bm):
+                    bp, bn = to_world(self.bauble_pos[bm], self.bauble_nrm[bm])
+                    pal_arr = np.array(palette.baubles, dtype=np.float32)
+                    bc = pal_arr[self.bauble_cidx[bm] % len(palette.baubles)]
+                    batches.append(PointBatch(bp, bn, bc, np.full(len(bp), 0.28, dtype=np.float32)))
 
         if garland_grow > 0.0:
-            gm = self.garland_v <= garland_grow
-            if np.any(gm):
-                gp, gn = to_world(self.garland_pos[gm], self.garland_nrm[gm])
-                shimmer = 0.85 + 0.25 * np.sin(t * 2.4 + self.garland_v[gm] * 18.0)
+            gm = slice(None) if garland_grow >= 1.0 else (self.garland_v <= garland_grow)
+            gp, gn = to_world(self.garland_pos[gm], self.garland_nrm[gm])
+            if len(gp) > 0:
+                shimmer = np.float32(0.85) + np.float32(0.25) * np.sin(np.float32(t * 2.4) + self.garland_v[gm] * np.float32(18.0))
                 gc = np.array(palette.garland, dtype=np.float32)[None, :] * shimmer[:, None]
                 batches.append(PointBatch(gp, gn, gc, np.full(len(gp), 0.26, dtype=np.float32)))
-
-        if ornament_grow > 0.0:
-            orn_cut = 0.29 + (1.40 - 0.29) * ornament_grow
-            bm = self.bauble_y <= orn_cut
-            if np.any(bm):
-                bp, bn = to_world(self.bauble_pos[bm], self.bauble_nrm[bm])
-                pal_arr = np.array(palette.baubles, dtype=np.float32)
-                bc = pal_arr[self.bauble_cidx[bm] % len(palette.baubles)]
-                batches.append(PointBatch(bp, bn, bc, np.full(len(bp), 0.28, dtype=np.float32)))
 
         if lights_power > 0.0:
             l_cut = 0.29 + (1.42 - 0.29) * lights_power
@@ -899,6 +958,7 @@ class GiftsModel:
             all_n = np.concatenate([nrm, n1, n2], axis=0)
             all_rib = np.concatenate([rib, np.ones(len(b1) + len(b2), dtype=bool)])
             self.boxes.append(GiftBox(all_p, all_n, all_rib, widx, (wx, wz), yaw, delay))
+        self._full_cache: dict[str, PointBatch] = {}
 
     def build_batch(
         self,
@@ -908,6 +968,10 @@ class GiftsModel:
     ) -> PointBatch:
         if gift_progress <= 0.0:
             return empty_batch()
+        if gift_progress >= 1.0:
+            cached = self._full_cache.get(palette.name)
+            if cached is not None:
+                return cached
 
         batches: list[PointBatch] = []
         for box in self.boxes:
@@ -924,7 +988,10 @@ class GiftsModel:
             col = np.where(box.is_ribbon[:, None], rib_c[None, :], wrap_c[None, :])
             emit = np.where(box.is_ribbon, 0.50, 0.20).astype(np.float32)
             batches.append(PointBatch(world_p, world_n, col, emit))
-        return concat_batches(batches)
+        out = concat_batches(batches)
+        if gift_progress >= 1.0:
+            self._full_cache[palette.name] = out
+        return out
 
 
 class SantaRig:
@@ -1044,6 +1111,7 @@ class SantaRig:
         walk_phase: float,
         stride_amp: float,
         bend: float,
+        conjure: float,
         wave: float,
         laugh_bounce: float,
         sack_on_back: bool,
@@ -1058,17 +1126,19 @@ class SantaRig:
         upper = self._xform(self.upper, bend_R, (0.0, hip_y, 0.0))
 
         sh_r_local = np.array([0.015, 0.26, 0.0], dtype=np.float32) @ bend_R.T + np.array([0.0, hip_y, 0.0], dtype=np.float32)
-        if wave > 0.02 or bend > 0.05:
-            r_raise = wave * (1.85 + 0.40 * math.sin(t * 7.2)) + bend * 1.15
-        else:
-            r_raise = -swing * 0.65
-        arm_r = self._xform(self.arm_r, rot_z(r_raise), tuple(sh_r_local))
+        r_raise = (
+            wave * (1.85 + 0.40 * math.sin(t * 7.2))
+            + conjure * (1.62 + 0.16 * math.sin(t * 5.2))
+            - swing * 0.65
+        )
+        arm_r_R = rot_z(r_raise)
+        arm_r = self._xform(self.arm_r, arm_r_R, tuple(sh_r_local))
 
         sh_l_local = np.array([0.01, 0.26, 0.0], dtype=np.float32) @ bend_R.T + np.array([0.0, hip_y, 0.0], dtype=np.float32)
         if sack_on_back:
             l_raise = -0.85 + swing * 0.15
         else:
-            l_raise = wave * (1.15 + 0.30 * math.sin(t * 7.2 + 0.8))
+            l_raise = wave * (1.15 + 0.30 * math.sin(t * 7.2 + 0.8)) + conjure * 0.22
         arm_l = self._xform(self.arm_l, rot_z(l_raise), tuple(sh_l_local))
 
         if sack_on_back:
@@ -1085,7 +1155,8 @@ class SantaRig:
         wp = ((local_all.pos * scale) @ R_world.T) + world_off[None, :]
         wn = local_all.nrm @ R_world.T
 
-        hand_local = np.array([0.0, -0.25, -0.18], dtype=np.float32) @ rot_z(r_raise).T + sh_r_local
+        # Lock directly to the outer edge of Santa's extended right white mitten
+        hand_local = np.array([0.0, -0.285, -0.165 * 1.12], dtype=np.float32) @ arm_r_R.T + sh_r_local
         hand_world = ((hand_local * scale) @ R_world.T) + world_off
         return PointBatch(wp, wn, local_all.col, local_all.emit), hand_world
 
@@ -1096,7 +1167,7 @@ def build_conjure_sparkles(
     conjure_progress: float,
     t: float,
 ) -> PointBatch:
-    """Golden magic sparkles arcing from Santa's hand toward the growing gifts."""
+    """Golden magic sparkles arcing cleanly out of Santa's hand toward the growing gifts."""
     if conjure_progress <= 0.0 or conjure_progress >= 1.0:
         return empty_batch()
 
@@ -1105,21 +1176,41 @@ def build_conjure_sparkles(
         dtype=np.float32,
     )
     rng = np.random.default_rng(909)
-    n_per = 42
+    n_per = 48
     pts, cols, emits = [], [], []
+    reach = clamp01(conjure_progress / 0.22)
+    reach = reach * reach * (3.0 - 2.0 * reach)
+    tail = clamp01((conjure_progress - 0.76) / 0.24)
+    tail = tail * tail * (3.0 - 2.0 * tail)
+    glow_amp = math.sin(conjure_progress * math.pi)
+    c_gold = np.array(palette.star, dtype=np.float32)
+
+    # Small glowing magic spark cluster anchored right at Santa's palm/fingertips
+    hand_orb = rng.normal(scale=0.018, size=(36, 3)).astype(np.float32) + hand_world[None, :]
+    pts.append(hand_orb)
+    cols.append(np.tile(c_gold, (len(hand_orb), 1)))
+    emits.append(np.full(len(hand_orb), 1.35 * glow_amp * (1.0 - tail), dtype=np.float32))
+
     for ti, tgt in enumerate(targets):
-        u = (rng.random(n_per, dtype=np.float32) + t * 0.8 + ti * 0.17) % 1.0
-        arc = np.sin(u * math.pi) * 0.28
-        p = hand_world[None, :] * (1.0 - u[:, None]) + tgt[None, :] * u[:, None]
-        p[:, 1] += arc
-        p += rng.normal(scale=0.025, size=p.shape).astype(np.float32)
-        c_gold = np.array(palette.star, dtype=np.float32)
+        base_u = rng.random(n_per, dtype=np.float32)
+        jitter = rng.normal(size=(n_per, 3)).astype(np.float32)
         c_alt = np.array(palette.lights[ti % len(palette.lights)], dtype=np.float32)
         mix = rng.random(n_per, dtype=np.float32)[:, None]
-        c = c_gold[None, :] * mix + c_alt[None, :] * (1.0 - mix)
+        c_box = c_gold[None, :] * mix + c_alt[None, :] * (1.0 - mix)
+
+        u = (base_u + t * 0.85 + ti * 0.17) % 1.0
+        vis = (u <= reach) & (u >= tail)
+        if not np.any(vis):
+            continue
+        uv = u[vis]
+        arc = np.sin(uv * math.pi) * (0.20 + 0.05 * (ti % 2))
+        spread = (0.005 + 0.028 * np.sin(uv * math.pi))[:, None]
+        p = hand_world[None, :] * (1.0 - uv[:, None]) + tgt[None, :] * uv[:, None]
+        p[:, 1] += arc
+        p += jitter[vis] * spread
         pts.append(p)
-        cols.append(c)
-        emits.append(np.full(n_per, 1.35 * math.sin(conjure_progress * math.pi), dtype=np.float32))
+        cols.append(c_box[vis])
+        emits.append(np.full(len(p), 1.35 * glow_amp, dtype=np.float32))
 
     all_p = np.concatenate(pts, axis=0)
     all_n = np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float32), (len(all_p), 1))

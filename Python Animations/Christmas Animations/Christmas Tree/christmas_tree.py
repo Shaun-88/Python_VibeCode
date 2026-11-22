@@ -64,6 +64,7 @@ class StoryState:
     walk_phase: float
     stride_amp: float
     bend: float
+    conjure_pose: float
     wave: float
     laugh_bounce: float
     sack_on_back: bool
@@ -98,7 +99,8 @@ def evaluate_story(t: float) -> StoryState:
     sack_on_back = t < 16.3
     santa_yaw = -0.15 + 0.42 * smoothstep(t, 15.9, 16.6)
 
-    bend = math.sin(ramp(t, 16.2, 17.8) * math.pi) * 0.72 if 16.2 <= t <= 17.8 else 0.0
+    conjure_pose = smoothstep(t, 16.15, 16.55) * (1.0 - smoothstep(t, 18.85, 19.28))
+    bend = conjure_pose * 0.48
     conjure_progress = ramp(t, 16.45, 19.1)
     gift_progress = ramp(t, 16.7, 19.3)
 
@@ -144,6 +146,7 @@ def evaluate_story(t: float) -> StoryState:
         walk_phase=walk_phase,
         stride_amp=stride_amp,
         bend=bend,
+        conjure_pose=conjure_pose,
         wave=wave,
         laugh_bounce=laugh_bounce,
         sack_on_back=sack_on_back,
@@ -206,6 +209,7 @@ class ChristmasDirector:
                 walk_phase=st.walk_phase,
                 stride_amp=st.stride_amp,
                 bend=st.bend,
+                conjure=st.conjure_pose,
                 wave=st.wave,
                 laugh_bounce=st.laugh_bounce,
                 sack_on_back=st.sack_on_back,
@@ -302,11 +306,17 @@ def record_video(
     try:
         for i in range(total_frames):
             rgb = director.render_at(i / fps, theme_key, light_mode, snow_on, show_hints)
-            proc.stdin.write(rgb.tobytes())
+            try:
+                proc.stdin.write(rgb.tobytes())
+            except BrokenPipeError:
+                break
             if (i + 1) % max(1, fps * 2) == 0 or (i + 1) == total_frames:
                 print(f"  {i + 1}/{total_frames} frames", flush=True)
     finally:
-        proc.stdin.close()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
         stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
         rc = proc.wait()
         if rc != 0:
@@ -327,7 +337,7 @@ def run_window(args: argparse.Namespace) -> None:
     theme_idx = THEME_ORDER.index(args.theme)
     mode_idx = LIGHT_MODES.index(args.mode)
     snow_on = not args.no_snow
-    show_hints = not args.hide_ui
+    show_hints = bool(args.show_ui) and not args.hide_ui
     fullscreen = bool(args.fullscreen)
 
     if args.snapshot_dir:
@@ -390,7 +400,7 @@ def run_window(args: argparse.Namespace) -> None:
                         mode_idx = (mode_idx + 1) % len(LIGHT_MODES)
                     elif event.key == pygame.K_s:
                         snow_on = not snow_on
-                    elif event.key == pygame.K_h:
+                    elif event.key in (pygame.K_c, pygame.K_h):
                         show_hints = not show_hints
                     elif event.key == pygame.K_r:
                         sim_t = 0.0
@@ -410,7 +420,7 @@ def run_window(args: argparse.Namespace) -> None:
                 snow_on=snow_on,
                 show_hints=show_hints,
             )
-            surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+            surf = pygame.image.frombuffer(rgb.data, (WIN_W, WIN_H), "RGB")
             if screen.get_size() != (WIN_W, WIN_H):
                 scaled = pygame.transform.smoothscale(surf, screen.get_size())
                 screen.blit(scaled, (0, 0))
@@ -433,7 +443,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30, help="Target frame rate (default: 30)")
     parser.add_argument("--skip-intro", action="store_true", help="Jump straight to the final loop")
     parser.add_argument("--no-snow", action="store_true", help="Start with window snow disabled")
-    parser.add_argument("--hide-ui", action="store_true", help="Start in pure screensaver mode")
+    parser.add_argument("--show-ui", action="store_true", help="Show the bottom control bar at startup")
+    parser.add_argument("--hide-ui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--fullscreen", action="store_true", help="Launch in fullscreen")
     parser.add_argument("--duration", type=float, default=None, help="Auto-exit after N seconds")
     parser.add_argument("--snapshot-dir", type=str, default=None, help="Export storyboard PNGs and exit")
@@ -444,7 +455,12 @@ def parse_args() -> argparse.Namespace:
         default=28.0,
         help="Length in seconds when using --record (default: 28.0)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fps <= 0:
+        parser.error("--fps must be >= 1")
+    if args.record_seconds <= 0.0:
+        parser.error("--record-seconds must be > 0")
+    return args
 
 
 def main() -> None:

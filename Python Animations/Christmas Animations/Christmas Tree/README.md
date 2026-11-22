@@ -19,17 +19,19 @@ python christmas_tree.py
 Export directly to MP4 (requires `ffmpeg` on `PATH`):
 
 ```bash
-python christmas_tree.py --record christmas_room.mp4 --hide-ui
+python christmas_tree.py --record christmas_room.mp4
 ```
 
 ### Live Controls
+
+The animation launches in clean UI-free view by default. Press `C` anytime to show or hide the bottom control bar (or pass `--show-ui`).
 
 | Key | Action |
 | :--- | :--- |
 | `1`, `2`, `3` | Switch theme (`Classic`, `Candlelight`, `Aurora`) |
 | `M` | Cycle light animation mode (`Auto`, `Twinkle`, `Chase`, `Sparkle`, `Bands`) |
 | `S` | Toggle snowfall outside the window |
-| `H` | Hide/show bottom control bar (pure screensaver view) |
+| `C` | Show/hide bottom control bar (`H` also works) |
 | `F` | Toggle fullscreen |
 | `Space` | Pause / resume |
 | `R` | Replay full storyboard from the beginning |
